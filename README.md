@@ -13,10 +13,26 @@ The G522's USB receiver stays plugged in when the headset is powered off, so Win
 ## Requirements
 
 - Windows 10 or 11
-- [.NET 10 SDK](https://dotnet.microsoft.com/download) to build (or the .NET 10 Desktop Runtime to run a framework-dependent build)
+- [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (x64), or the .NET 10 SDK to build it yourself
 - G522 LIGHTSPEED with its receiver (USB `046D:0B18`). G HUB can stay running alongside it.
 
-## Build and run
+## Install
+
+Download `logiswitch.exe` from the latest [release](../../releases/latest). Put it somewhere permanent, for example `%LOCALAPPDATA%\Programs\logiswitch`, and run it. To launch it at sign-in, turn on **Start with Windows** in its tray menu.
+
+Each push to `main` that changes code builds a new release automatically (`.github/workflows/release.yml`). The version is `<major>.<minor>.<workflow run number>`, with major and minor taken from `<Version>` in `logiswitch.csproj`.
+
+## Build from source
+
+To build and install to `%LOCALAPPDATA%\Programs\logiswitch` in one step:
+
+```bash
+pwsh ./install.ps1
+```
+
+This needs the .NET 10 SDK. Run it again to update: it stops the running copy, publishes over it and starts the new one.
+
+To build and run the development copy instead:
 
 ```bash
 dotnet build -c Release
@@ -26,16 +42,20 @@ dotnet build -c Release
 bin/Release/net10.0-windows/logiswitch.exe
 ```
 
+Only one copy can run at a time, so exit the installed one first.
+
 A headphones icon appears in the tray:
 
 | Colour | Meaning |
 |---|---|
-| Green | Headset on |
+| White (dark on a light taskbar) | Headset on, with the battery level underneath |
 | Grey | Headset off |
 | Orange | Receiver not found |
 | Dark grey | Starting, or paused |
 
-Right-click it to choose the fallback output and microphone, pause switching, toggle **Start with Windows**, or open the log and config. Left-clicking asks the receiver for its state right away.
+The battery is shown as a percentage, or as a bar if you choose that style. Its colour is green above 30%, amber from 16% to 30%, red at 15% or lower, and blue while charging.
+
+Click the icon (left or right) to open the menu. From there you can choose the fallback output and microphone, the icon style, pause switching, toggle **Start with Windows**, or open the log and config. The menu follows the Windows light/dark mode, and opening it also re-checks the headset state.
 
 ## Configuration
 
@@ -52,6 +72,7 @@ Settings live in `%APPDATA%\logiswitch\config.json` and are created on first run
 | `RespectManualChoice` | `true` | Don't override a device you picked yourself |
 | `StatusPollSeconds` | `60` | How often to re-check the headset state as a safety net |
 | `Paused` | `false` | Stop switching |
+| `TrayIconStyle` | `"Percent"` | `"Percent"` (headphones with the percentage underneath) or `"Bar"` (headphones with a battery bar) |
 
 The log is at `%LOCALAPPDATA%\logiswitch\logiswitch.log`.
 

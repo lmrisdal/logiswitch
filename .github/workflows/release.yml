@@ -1,0 +1,65 @@
+name: Release
+
+# Every push to main that changes code builds logiswitch and publishes it as a GitHub release.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create tags and releases
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Work out version
+        id: version
+        shell: pwsh
+        run: |
+          # Major.minor from <Version> in the project file; the patch number is the workflow run number.
+          $project = [xml](Get-Content logiswitch.csproj)
+          $base = @($project.Project.PropertyGroup | ForEach-Object { $_.Version } | Where-Object { $_ })[0]
+          if (-not $base) { throw 'No <Version> in logiswitch.csproj' }
+          $parts = $base.Split('.')
+          $version = "$($parts[0]).$($parts[1]).${{ github.run_number }}"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $version"
+
+      - name: Publish
+        shell: pwsh
+        run: >
+          dotnet publish logiswitch.csproj
+          -c Release -r win-x64 --self-contained false
+          -p:PublishSingleFile=true -p:DebugType=embedded
+          -p:Version=${{ steps.version.outputs.version }}
+          -o publish
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = @"
+          Download **logiswitch.exe** and put it somewhere permanent, e.g. ``%LOCALAPPDATA%\Programs\logiswitch``, then run it.
+
+          Requires the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (x64).
+          "@
+          gh release create "v$env:VERSION" publish/logiswitch.exe `
+            --title "logiswitch $env:VERSION" `
+            --target "$env:GITHUB_SHA" `
+            --notes $notes `
+            --generate-notes
