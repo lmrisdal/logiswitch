@@ -10,17 +10,23 @@ public enum HeadsetState
     On,
 }
 
+public sealed record BatteryStatus(int Percent, bool Charging);
+
 /// <summary>
-/// Tracks whether the G522 headset is powered on, by talking to its LIGHTSPEED receiver.
+/// Tracks whether the G522 headset is powered on, and its battery, by talking to its LIGHTSPEED receiver.
 ///
 /// The receiver speaks Logitech's "Centurion" protocol on HID usage page 0xFFA0 with 64-byte
 /// frames: <c>50 23 | len | flags | feature-index | function|sw-id | params...</c>, where
 /// <c>len</c> counts the flags byte plus the payload. Its bridge feature (ID 0x0003):
 /// <list type="bullet">
 ///   <item>sends an unsolicited event <c>[bridge, 00, 00, connected]</c> on headset power on/off;</item>
-///   <item>answers function 0 with <c>03 E8 00 nn 01</c>, where nn is the number of connected headsets.</item>
+///   <item>answers function 0 with <c>03 E8 00 nn 01</c>, where nn is the number of connected headsets;</item>
+///   <item>forwards messages to the headset with function 1:
+///     <c>[bridge, 1|sw, size-hi, size-lo, 00, sub-feature, function|sw, params...]</c>. The headset's
+///     reply comes back as <c>[bridge, 10, size-hi, size-lo, 00, sub-feature, function|sw, result...]</c>.</item>
 /// </list>
-/// Both were verified on hardware; the format matches HeadsetControl's G522 support.
+/// The headset's battery feature (ID 0x0104) answers function 0 with <c>[percent, ?, charging-state]</c>.
+/// All of this was verified on hardware; the format matches HeadsetControl's G522 support.
 /// The receiver is shared with G HUB, so requests carry our own software ID.
 /// </summary>
 public sealed class HeadsetMonitor : IDisposable
@@ -32,6 +38,9 @@ public sealed class HeadsetMonitor : IDisposable
     private const byte SoftwareId = 0x0B;             // G HUB uses 0x0F, HeadsetControl 0x01
     private const byte RootFeatureIndex = 0x00;
     private const ushort BridgeFeatureId = 0x0003;
+    private const ushort BatteryFeatureId = 0x0104;
+    private const byte BridgeSendFunction = 0x10;
+    private static readonly TimeSpan BatteryDelayAfterConnect = TimeSpan.FromSeconds(1.5);
     private static readonly byte[] Prefix = [0x50, 0x23];
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(3);
@@ -43,15 +52,23 @@ public sealed class HeadsetMonitor : IDisposable
     private readonly SemaphoreSlim _refreshSignal = new(0, 1);
     private FileStream? _writer;
     private byte? _bridgeIndex;
+    private byte? _batteryIndex;
+    private bool _batteryUnsupported;
     private Task? _loop;
     private HeadsetState _state = HeadsetState.Unknown;
+    private BatteryStatus? _battery;
 
     public HeadsetMonitor(TimeSpan pollInterval) => _pollInterval = pollInterval;
 
     /// <summary>Raised on a background thread whenever the state changes.</summary>
     public event Action<HeadsetState>? StateChanged;
 
+    /// <summary>Raised on a background thread when the battery reading changes (null = unknown).</summary>
+    public event Action<BatteryStatus?>? BatteryChanged;
+
     public HeadsetState State => _state;
+
+    public BatteryStatus? Battery => _battery;
 
     public void Start() => _loop ??= Task.Run(() => RunAsync(_cts.Token));
 
@@ -97,13 +114,15 @@ public sealed class HeadsetMonitor : IDisposable
             lastMissingReason = null;
             _writer = writeStream;
             _bridgeIndex = null;
+            _batteryIndex = null;
+            _batteryUnsupported = false;
             Log.Info("Receiver opened");
 
             var reader = Task.Run(() => ReadLoopAsync(readStream, ct), ct);
             using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             try
             {
-                var lookup = await SendRequestAsync(RootFeatureIndex, 0x00, [(byte)(BridgeFeatureId >> 8), (byte)BridgeFeatureId]);
+                var lookup = await SendRequestAsync(RootFeatureIndex, 0x00, [(byte)(BridgeFeatureId >> 8), (byte)(BridgeFeatureId & 0xFF)]);
                 if (lookup.Length == 0 || lookup[0] == 0)
                 {
                     throw new InvalidOperationException("Receiver has no bridge feature");
@@ -153,6 +172,7 @@ public sealed class HeadsetMonitor : IDisposable
             }
 
             SetState(HeadsetState.ReceiverMissing);
+            SetBattery(null);
             await DelayQuietly(TimeSpan.FromSeconds(1), ct);
         }
     }
@@ -216,6 +236,23 @@ public sealed class HeadsetMonitor : IDisposable
             var on = payload[3] != 0;
             Log.Info($"Receiver event: headset {(on ? "connected" : "disconnected")}");
             SetState(on ? HeadsetState.On : HeadsetState.Off);
+            if (on)
+            {
+                // Give the headset a moment to settle before asking it for its battery level.
+                _ = Task.Delay(BatteryDelayAfterConnect).ContinueWith(_ => RequestRefresh(), TaskScheduler.Default);
+            }
+            else
+            {
+                SetBattery(null);
+            }
+            return;
+        }
+
+        // Message from the headset, relayed by the bridge: [bridge, 1x, size, size, 00, sub...].
+        if (_bridgeIndex is { } relay && payload.Length >= 2 && payload[0] == relay
+            && (payload[1] & 0xF0) == BridgeSendFunction)
+        {
+            HandleBridgeMessage(payload);
             return;
         }
 
@@ -237,6 +274,47 @@ public sealed class HeadsetMonitor : IDisposable
         }
     }
 
+    private void HandleBridgeMessage(ReadOnlySpan<byte> payload)
+    {
+        // Low nibble set = the bridge acknowledging a request (ours or G HUB's); the real
+        // answer follows as a separate message with software ID 0.
+        if ((payload[1] & 0x0F) != 0 || payload.Length < 7 || payload[4] != 0x00)
+        {
+            return;
+        }
+
+        var sub = payload[5..];                      // [sub-feature, function|sw, result...]
+        if (sub[0] == 0xFF)
+        {
+            // Headset error: [FF, sub-feature, function|sw, code].
+            if (sub.Length >= 3 && (sub[2] & 0x0F) == SoftwareId
+                && _pending.TryRemove(BridgeKey(sub[1], sub[2]), out var failed))
+            {
+                failed.TrySetException(new IOException($"Headset rejected request (error 0x{(sub.Length > 3 ? sub[3] : 0):X2})"));
+            }
+            return;
+        }
+
+        if ((sub[1] & 0x0F) == SoftwareId)
+        {
+            if (_pending.TryRemove(BridgeKey(sub[0], sub[1]), out var waiter))
+            {
+                waiter.TrySetResult(sub[2..].ToArray());
+            }
+            return;
+        }
+
+        // Software ID 0 = unsolicited notification from the headset.
+        if ((sub[1] & 0x0F) == 0 && _batteryIndex is { } battery && sub[0] == battery)
+        {
+            Log.Info($"Battery notification: {Convert.ToHexString(sub)}");
+            if (ParseBattery(sub[2..]) is { } status)
+            {
+                SetBattery(status);
+            }
+        }
+    }
+
     private async Task RefreshStatusAsync()
     {
         if (_bridgeIndex is not { } bridge)
@@ -249,26 +327,103 @@ public sealed class HeadsetMonitor : IDisposable
             Log.Warn($"Unexpected bridge status reply: {Convert.ToHexString(status)}");
             return;
         }
-        SetState(status[2] == 0 && status[3] == 0 ? HeadsetState.Off : HeadsetState.On);
+        var on = !(status[2] == 0 && status[3] == 0);
+        SetState(on ? HeadsetState.On : HeadsetState.Off);
+
+        if (!on)
+        {
+            SetBattery(null);
+            return;
+        }
+
+        try
+        {
+            await RefreshBatteryAsync();
+        }
+        catch (Exception ex)
+        {
+            // Not fatal: the headset may still be settling after power-on. The next poll retries.
+            Log.Warn($"Battery read failed: {ex.Message}");
+        }
     }
 
-    private async Task<byte[]> SendRequestAsync(byte featureIndex, byte function, byte[] parameters)
+    private async Task RefreshBatteryAsync()
+    {
+        if (_batteryUnsupported)
+        {
+            return;
+        }
+
+        if (_batteryIndex is null)
+        {
+            var lookup = await SendBridgeRequestAsync(RootFeatureIndex, 0x00, [(byte)(BatteryFeatureId >> 8), (byte)(BatteryFeatureId & 0xFF)]);
+            if (lookup.Length == 0 || lookup[0] == 0)
+            {
+                Log.Warn("Headset has no battery feature");
+                _batteryUnsupported = true;
+                return;
+            }
+            _batteryIndex = lookup[0];
+            Log.Info($"Battery feature at headset index 0x{_batteryIndex:X2}");
+        }
+
+        var reply = await SendBridgeRequestAsync(_batteryIndex.Value, 0x00, []);
+        if (ParseBattery(reply) is { } status)
+        {
+            SetBattery(status);
+        }
+        else
+        {
+            Log.Warn($"Unexpected battery reply: {Convert.ToHexString(reply)}");
+        }
+    }
+
+    private static BatteryStatus? ParseBattery(ReadOnlySpan<byte> result)
+    {
+        if (result.Length == 0 || result[0] > 100)
+        {
+            return null;
+        }
+        // Charging states 1 and 2 both mean charging (per HeadsetControl).
+        var charging = result.Length >= 3 && result[2] is 1 or 2;
+        return new BatteryStatus(result[0], charging);
+    }
+
+    private Task<byte[]> SendRequestAsync(byte featureIndex, byte function, byte[] parameters)
+    {
+        var functionSw = (byte)((function & 0xF0) | SoftwareId);
+        byte[] payload = [featureIndex, functionSw, .. parameters];
+        return SendAsync(payload, Key(featureIndex, functionSw));
+    }
+
+    /// <summary>Sends a request to the headset through the receiver's bridge.</summary>
+    private Task<byte[]> SendBridgeRequestAsync(byte subFeatureIndex, byte function, byte[] parameters)
+    {
+        var bridge = _bridgeIndex ?? throw new IOException("Bridge not discovered");
+        var functionSw = (byte)((function & 0xF0) | SoftwareId);
+        byte[] sub = [0x00, subFeatureIndex, functionSw, .. parameters];
+        byte[] payload =
+        [
+            bridge, (byte)(BridgeSendFunction | SoftwareId),
+            (byte)((sub.Length >> 8) & 0x0F), (byte)sub.Length,
+            .. sub,
+        ];
+        return SendAsync(payload, BridgeKey(subFeatureIndex, functionSw));
+    }
+
+    private async Task<byte[]> SendAsync(byte[] payload, int key)
     {
         var writer = _writer ?? throw new IOException("Receiver not open");
         await _requestGate.WaitAsync();
         try
         {
-            var functionSw = (byte)((function & 0xF0) | SoftwareId);
             var frame = new byte[FrameSize];
             frame[0] = Prefix[0];
             frame[1] = Prefix[1];
-            frame[2] = (byte)(2 + parameters.Length + 1);
+            frame[2] = (byte)(payload.Length + 1);
             frame[3] = 0x00;
-            frame[4] = featureIndex;
-            frame[5] = functionSw;
-            parameters.CopyTo(frame, 6);
+            payload.CopyTo(frame, 4);
 
-            var key = Key(featureIndex, functionSw);
             var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
             _pending[key] = tcs;
             try
@@ -288,6 +443,28 @@ public sealed class HeadsetMonitor : IDisposable
     }
 
     private static int Key(byte featureIndex, byte functionSw) => (featureIndex << 8) | functionSw;
+
+    private static int BridgeKey(byte subFeatureIndex, byte functionSw) => 0x10000 | Key(subFeatureIndex, functionSw);
+
+    private void SetBattery(BatteryStatus? battery)
+    {
+        if (_battery == battery)
+        {
+            return;
+        }
+        Log.Info(battery is null
+            ? "Battery: unknown"
+            : $"Battery: {battery.Percent}%{(battery.Charging ? " (charging)" : "")}");
+        _battery = battery;
+        try
+        {
+            BatteryChanged?.Invoke(battery);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("BatteryChanged handler failed", ex);
+        }
+    }
 
     private void FailPending()
     {

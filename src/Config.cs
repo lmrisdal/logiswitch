@@ -1,6 +1,17 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace LogiSwitch;
+
+/// <summary>How the tray icon shows the battery level while the headset is on.</summary>
+internal enum TrayIconStyle
+{
+    /// <summary>The battery percentage as a number.</summary>
+    Percent,
+
+    /// <summary>Headphones glyph with a battery bar underneath.</summary>
+    Bar,
+}
 
 /// <summary>User settings, stored as JSON in %APPDATA%\logiswitch\config.json.</summary>
 internal sealed class Config
@@ -34,7 +45,14 @@ internal sealed class Config
 
     public bool Paused { get; set; }
 
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    /// <summary>"Percent" or "Bar".</summary>
+    public TrayIconStyle TrayIconStyle { get; set; } = TrayIconStyle.Percent;
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        Converters = { new JsonStringEnumConverter() },
+    };
 
     public static string FilePath { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "logiswitch", "config.json");

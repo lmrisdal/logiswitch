@@ -15,6 +15,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly ContextMenuStrip _menu = new();
     private HeadsetState _state = HeadsetState.Unknown;
+    private BatteryStatus? _battery;
 
     public TrayApp()
     {
@@ -23,23 +24,33 @@ internal sealed class TrayApp : ApplicationContext
         _policy = new SwitchPolicy(_config);
         _monitor = new HeadsetMonitor(TimeSpan.FromSeconds(Math.Max(10, _config.StatusPollSeconds)));
 
-        _menu.Opening += (_, _) => BuildMenu();
+        _menu.Opening += (_, _) =>
+        {
+            BuildMenu();
+            _monitor.RequestRefresh();
+        };
         _tray = new NotifyIcon
         {
             ContextMenuStrip = _menu,
             Visible = true,
         };
-        _tray.MouseClick += (_, e) =>
+        _tray.MouseUp += (_, e) =>
         {
             if (e.Button == MouseButtons.Left)
             {
-                _monitor.RequestRefresh();
+                ShowMenuFromTray();
             }
         };
         UpdateTray();
 
         _monitor.StateChanged += state => _ui.Post(_ => OnStateChanged(state), null);
+        _monitor.BatteryChanged += battery => _ui.Post(_ =>
+        {
+            _battery = battery;
+            UpdateTray();
+        }, null);
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
 
         Log.Info($"logiswitch {Application.ProductVersion} started; config {Config.FilePath}");
         _monitor.Start();
@@ -61,10 +72,38 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// Opens the menu the way a right-click does. NotifyIcon's own (non-public) ShowContextMenu
+    /// also makes the menu close properly when you click elsewhere; Show() alone doesn't.
+    /// </summary>
+    private void ShowMenuFromTray()
+    {
+        var show = typeof(NotifyIcon).GetMethod("ShowContextMenu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        if (show is not null)
+        {
+            show.Invoke(_tray, null);
+        }
+        else
+        {
+            _menu.Show(Cursor.Position);
+        }
+    }
+
+    private void OnUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        // Light/dark mode changes arrive as General; redraw so the glyph matches the taskbar.
+        if (e.Category is UserPreferenceCategory.General or UserPreferenceCategory.Color)
+        {
+            _ui.Post(_ => UpdateTray(), null);
+        }
+    }
+
     private void UpdateTray()
     {
-        _tray.Icon = _icons.For(_state, _config.Paused);
-        var text = $"logiswitch: {StateText(_state)}{(_config.Paused ? " (paused)" : "")}";
+        _icons.LightTaskbar = Ui.Theme.Current.IsLight;
+        _tray.Icon = _icons.For(_state, _config.Paused, _battery, _config.TrayIconStyle);
+        var text = $"logiswitch: {StateText(_state)}{BatteryText(_battery)}{(_config.Paused ? " (paused)" : "")}";
         _tray.Text = text.Length > 127 ? text[..127] : text;
     }
 
@@ -76,10 +115,14 @@ internal sealed class TrayApp : ApplicationContext
         _ => "starting…",
     };
 
+    private static string BatteryText(BatteryStatus? battery) => battery is null
+        ? ""
+        : $", battery {battery.Percent}%{(battery.Charging ? " (charging)" : "")}";
+
     private void BuildMenu()
     {
         _menu.Items.Clear();
-        _menu.Items.Add(new ToolStripMenuItem($"Headset: {StateText(_state)}") { Enabled = false });
+        _menu.Items.Add(new ToolStripMenuItem($"Headset: {StateText(_state)}{BatteryText(_battery)}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
 
         List<AudioDevice> outputs = [], inputs = [];
@@ -153,6 +196,24 @@ internal sealed class TrayApp : ApplicationContext
         };
         _menu.Items.Add(pause);
 
+        var iconMenu = new ToolStripMenuItem("Tray icon");
+        foreach (var (style, label) in new[]
+                 {
+                     (TrayIconStyle.Percent, "Battery percentage"),
+                     (TrayIconStyle.Bar, "Headphones with battery bar"),
+                 })
+        {
+            var item = new ToolStripMenuItem(label) { Checked = _config.TrayIconStyle == style };
+            item.Click += (_, _) =>
+            {
+                _config.TrayIconStyle = style;
+                _config.Save();
+                UpdateTray();
+            };
+            iconMenu.DropDownItems.Add(item);
+        }
+        _menu.Items.Add(iconMenu);
+
         var autostart = new ToolStripMenuItem("Start with Windows") { Checked = SafeAutostartEnabled() };
         autostart.Click += (_, _) =>
         {
@@ -165,6 +226,8 @@ internal sealed class TrayApp : ApplicationContext
         _menu.Items.Add("Open log", null, (_, _) => OpenFile(Log.FilePath));
         _menu.Items.Add("Open config", null, (_, _) => OpenFile(Config.FilePath));
         _menu.Items.Add("Exit", null, (_, _) => ExitThread());
+
+        Ui.MenuRenderer.Apply(_menu, Ui.Theme.Current);
     }
 
     private static bool SafeAutostartEnabled()
@@ -189,6 +252,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         Log.Info("Exiting");
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
         _tray.Visible = false;
         _monitor.Dispose();
         _policy.Dispose();
